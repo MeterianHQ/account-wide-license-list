@@ -1,190 +1,196 @@
 import requests
-import json
-import time
 import os
-import csv
-import re
 import argparse
+import re
+import sys
+import csv
+import time
 
-access_token = os.environ.get("METERIAN_ACCESS_TOKEN_QA")
-reports_api = "https://qa.meterian.com/api/v1/reports"
-polling_interval = 5
+access_token = os.environ.get("METERIAN_ACCESS_TOKEN")
 
 headers = {
     "Authorization": f"Token {access_token}"
 }
 
-name_to_timestamps = {}
-libraries_set = set()
-library_to_projects = {}
-library_to_copyright = {}
-library_to_licenses = {}
+class HelpingParser(argparse.ArgumentParser):
+    def error(self, message):
+        sys.stderr.write(f'error: {message}\n')
+        self.print_help()
+        sys.stderr.write('\n')
+        sys.exit(-1)
+
+class ProjectEntry:
+    def __init__(self, uuid, name, branch):
+        self.uuid = uuid
+        self.name = name
+        self.branch = branch
+        
+class LicenseInformation:
+    def __init__(self, licenses_list, component_id, copyright_statement):
+        self.licenses_list = licenses_list
+        self.component_id = component_id
+        self.copyright_statement = copyright_statement
+        self.project_uuids_list = []
+        
+    def add_project_uuid_to_list(self, project_uuid):
+        self.project_uuids_list.append(project_uuid)
 
 def main():
-    project_entries, csv_filename = read_through_projects()
+    args = validate_user_input()
     
-    read_through_bibles(project_entries)
+    project_entries = get_account_project_entries(args.tag, args.environment)
     
-    write_bibles_to_csv(csv_filename)
-
-def read_through_projects():
-    target_tag, csv_filename = check_arguments()
-    project_entries = projects_get_request(target_tag)
-    store_latest_timestamps(project_entries)
+    id_to_license_map = generate_license_information(project_entries, args.environment)
     
-    return project_entries, csv_filename
-
-def check_arguments():
-    target_tag, csv_filename = arguments()
-
-    if csv_filename is None:
-        csv_filename = "bibles"
-    csv_filename += ".csv"
-
-    create_csv_file(csv_filename)
-
-    return target_tag, csv_filename
-
-def arguments():
-    parser = argparse.ArgumentParser(description='generates csv file of bibles from the meterian api')
+    generate_report(project_entries, id_to_license_map, args.name)
+    
+def validate_user_input():
+    parser = HelpingParser(description='will generate a report that will list the licenses of all components given a meterian account')
     parser.add_argument('-t', '--tag', type=str, help='filter projects by tag')
-    parser.add_argument('-n', '--name', type=str, help='name the csv file')
+    parser.add_argument('-n', '--name', type=str, help='name the csv file', default='report.csv')
+    parser.add_argument('-e', '--environment', type=str, help='subdomain for the meterian api', default='www')
+
     args = parser.parse_args()
 
-    target_tag = args.tag
-    csv_filename = args.name
-    return target_tag, csv_filename
+    return args
 
-def create_csv_file(csv_filename):
-    csv_headers = [
-        "LICENSE", "LIBRARY", "COPYRIGHT", "PROJECTS"
-    ]
+def get_account_project_entries(filter_tag, meterian_api):
+    reports_api = f"https://{meterian_api}.meterian.com/api/v1/reports"
+    
+    reports_api_response = requests.get(reports_api, headers=headers)
+    
+    project_entries = reports_api_response.json()
+    project_entries = filter_projects_by_tag(filter_tag, project_entries)
 
-    with open(csv_filename, mode='w', newline='') as csv_file:
-        writer = csv.writer(csv_file)
-        writer.writerow(csv_headers)
-
-def projects_get_request(target_tag):
-    reports_response = requests.get(reports_api, headers=headers)
-
-    if reports_response.status_code == 200:
-        reports_data = reports_response.json()
+    project_uuid_to_project_entry_map = create_project_entries_map(project_entries)
+    
+    return project_uuid_to_project_entry_map
+    
+def filter_projects_by_tag(filter_tag, project_entries):
+    if filter_tag is not None:
+        filtered_project_entries = []
         
-        reports_data = tag_search(target_tag, reports_data)
-        
-        return reports_data
-    else:
-        print(f"Error: {reports_response.status_code}")
-        
-def tag_search(target_tag, data):
-    if target_tag is not None:
-        if target_tag:
-            data = [item for item in data if re.search(target_tag, str(item.get("tags")))]
-            if not data:
-                print(f"No items with the specified tag '{target_tag}' found.")
-    return data
-
-def store_latest_timestamps(reports_data):
-    for report in reports_data:
-        report_name = report.get("name")
-        report_timestamp = report.get("timestamp")
-
-        if report_name in name_to_timestamps:
-            if report_timestamp > name_to_timestamps[report_name]:
-                name_to_timestamps[report_name] = report_timestamp
-
-        else:
-            name_to_timestamps[report_name] = report_timestamp
+        for project_entry in project_entries:
+            tags = str(project_entry.get("tags"))
+            if re.search(filter_tag, tags):
+                filtered_project_entries.append(project_entry)
+                
+        if not filtered_project_entries:
+            print(f"No items with the specified tag '{filter_tag}' found")
+            sys.exit(1)
             
-def read_through_bibles(project_entries):
-    for project_entry in project_entries:
-        project_uuid = project_entry["uuid"]
-        project_name = project_entry.get("name")
-        project_branch = project_entry.get("branch")
-        project_timestamp = project_entry.get("timestamp")
-        
-        if project_timestamp != name_to_timestamps[project_name]:
+        return filtered_project_entries #returns filtered_project_entries when there is a filter_tag
+    
+    return project_entries #returns project_entries when there is no filter_tag
+
+def create_project_entries_map(project_entries):
+    project_uuid_to_project_entry_map = {}
+    for entry in project_entries:
+        if entry.get('uuid') in project_uuid_to_project_entry_map:
             continue
         
-        bible_get_request(project_uuid, project_name, project_branch)
+        project_entry = ProjectEntry(
+            entry.get('uuid'),
+            entry.get('name'),
+            entry.get('branch'))
         
-def bible_get_request(report_uuid, report_name, report_branch):
-    project_url = f"https://qa.meterian.com/api/v1/reports/{report_uuid}/bible"
-    percentage = bible_post_request(report_uuid, report_name, report_branch, project_url)
+        project_uuid_to_project_entry_map[project_entry.uuid] = project_entry
 
-    if percentage == 100:
-        bible_get_response = requests.get(project_url, headers=headers)
-        if bible_get_response.status_code == 200:
-            bible_data = bible_get_response.json()
+    return project_uuid_to_project_entry_map        
 
-            bible_json_to_map(bible_data, report_name, report_branch)
-        else:
-            print(f"Error, trying to get bible for {report_name}:{report_branch}: {bible_get_response.status_code}")
-            
-def bible_post_request(project_uuid, project_name, project_branch, project_url):
-    project_post_response = requests.post(project_url, headers=headers, data="")
-
-    if project_post_response.status_code == 200:
-        id = project_post_response.text
-        id_api = f"https://qa.meterian.com/api/v1/reports/{project_uuid}/bible/{id}"
-        percentage = check_percentage(id_api, headers, project_name, project_branch)
-
-        if percentage == 100:
-            return percentage
-    else:
-        print(f"Error, trying to get iden for {project_name}:{project_branch}: {project_post_response.status_code}")
+def generate_license_information(project_entries, meterian_api):
+    component_id_to_license_information_map = {}
+    
+    for uuid, project_entry in project_entries.items():
+        bible = get_bible(project_entry, meterian_api)
         
-def check_percentage(id_api, headers, project_name, project_branch):
-    current_percentage = 0
-    percentage_not_changed_count = 0
-
+        component_ids_list = []
+        
+        extract_license_information(bible, component_id_to_license_information_map, component_ids_list)
+        
+        add_project_uuid_to_license_information_map(project_entry.uuid, component_id_to_license_information_map, component_ids_list)
+        
+    return component_id_to_license_information_map
+        
+def get_bible(project_entry, meterian_api):
+    bibles_api = f"https://{meterian_api}.meterian.com/api/v1/reports/{project_entry.uuid}/bible"
+    
+    response = requests.post(bibles_api, headers=headers)
+    generation_id = response.content.decode()
+    
+    print(f"generating bible for project {project_entry.name}...")
     while True:
-        id_response = requests.get(id_api, headers=headers)
-        if id_response.status_code == 200:
-            print(f"{project_name}:{project_branch}:\n\t100%")
-            return 100  # Exit the loop for a 200 status
-
-        elif id_response.status_code == 404:
-            id_data = json.loads(id_response.text)
-            print(f"{project_name}:{project_branch}:\n\t{id_data}%")
-            if current_percentage == id_data:
-                percentage_not_changed_count += 1
-                if percentage_not_changed_count == 6:
-                    print(f"Timeout Error, trying to generate {project_name}:{project_branch}: {id_response.status_code}")
-                    break
-
-            elif id_data > current_percentage:
-                current_percentage = id_data
-                percentage_not_changed_count = 0
-        else:
-            print(f"Error, trying to get percentage for {project_name}: {id_response.status_code}")
-
-        time.sleep(polling_interval)
+        generation_percentage = get_generation_percentage(generation_id, bibles_api)
+        print(f"{generation_percentage}%")
         
-def bible_json_to_map(bible_data, project_name, project_branch):
-    project = f"{project_name}:{project_branch}"
+        if generation_percentage == 100:
+            bibles_api_get_response = requests.get(bibles_api, headers=headers)
+            bible = bibles_api_get_response.json()
+            return bible
+        
+        time.sleep(10)
+    
+def get_generation_percentage(generation_id, bibles_api):
+    percentage_api = f"{bibles_api}/{generation_id}"
+    
+    percentage_response = requests.get(percentage_api, headers=headers)
+    
+    generation_percentage = percentage_response.json()
+    
+    return generation_percentage
 
-    for language, array in bible_data['components'].items():
-        for item in array:
-            library = f"{language}:{item['name']}:{item['version']}"
-            if library not in libraries_set:
-                libraries_set.add(library)
-                library_to_projects[library] = project
+def extract_license_information(bible, component_id_to_license_information_map, component_ids_list):
+    for language, components in bible['components'].items():
+        for component in components:
+            component_id = f"{language}:{component['name']}:{component['version']}"
+            if component_id in component_id_to_license_information_map:
+                continue
+            
+            component_ids_list.append(component_id)
+            
+            if component.get('copyright'):
+                copyright_statement = component.get('copyright').get('text').replace('\n', '')
             else:
-                library_to_projects[library] += f";{project}"
-
-            copyright = item.get('copyright', {}).get('text', '').replace('\n', '') if 'copyright' in item else ''
-
-            licenses = ', '.join(item.get('licenses', []))
-
-            library_to_copyright[library] = f"{copyright}"
-            library_to_licenses[library] = licenses
+                copyright_statement = ''
+                
             
-def write_bibles_to_csv(csv_filename):
-    for library in libraries_set:
-        with open(csv_filename, mode='a', newline='') as csv_file:
-            writer = csv.writer(csv_file)
-            writer.writerow([library_to_licenses[library], library, library_to_copyright[library], library_to_projects[library]])
+            licenses_list = component.get('licenses', [])
             
+            licence_information = LicenseInformation(licenses_list, component_id, copyright_statement)
+            component_id_to_license_information_map[component_id] = licence_information
+            
+def add_project_uuid_to_license_information_map(project_entry_uuid, component_id_to_license_information_map, component_ids_list):
+    for component_id in component_ids_list:
+        component_id_to_license_information_map[component_id].add_project_uuid_to_list(project_entry_uuid)
+        
+def generate_report(project_entries, id_to_license_map, filename):
+    create_report_template(filename)
+    
+    for component_id, license_information in id_to_license_map.items():
+        project_names_and_branches = ""
+        for project_uuid in id_to_license_map[component_id].project_uuids_list:
+            project_names_and_branches += f"{project_entries[project_uuid].name}:{project_entries[project_uuid].branch};"
+        project_names_and_branches = project_names_and_branches[:-1]
+        write_to_report(component_id, id_to_license_map, project_names_and_branches, filename)
+            
+def create_report_template(filename):
+    report_headers = [
+        "LICENSES", "COMPONENT", "COPYRIGHT STATEMENTS", "PROJECTS"
+    ]
+    
+    with open(filename, mode="w", newline='') as report:
+        write = csv.writer(report)
+        write.writerow(report_headers)
+        
+def write_to_report(component_id, id_to_license_map, project_names_and_branch_list, filename):
+    with open(filename, mode='a', newline='') as report:
+        writer = csv.writer(report)
+        writer.writerow([
+            id_to_license_map[component_id].licenses_list,
+            component_id,
+            id_to_license_map[component_id].copyright_statement,
+            project_names_and_branch_list
+        ])
+        
 if __name__ == "__main__":
     main()
